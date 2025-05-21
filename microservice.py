@@ -1,69 +1,95 @@
+#!/usr/bin/env python3
 """
-Microservice A: Transaction Filtering Service
-Listens on a ZeroMQ REP socket, accepts JSON requests to:
-  - Filter transactions by month ("YYYY-MM") and type ("income"/"expense")
-  - Lookup a single transaction by its ID
+Microservice A: Transaction Filtering 
+
+Listens on ZeroMQ REP at tcp://0.0.0.0:5555.
+Accepts JSON requests to:
+  - Filter by month ("YYYY-MM")
+  - Filter by type ("income"/"expense")
+  - Lookup by transaction ID
 Responds with JSON: either a list of transactions or a single transaction object.
 """
-import zmq
+import os
 import json
+import zmq
 from bson.objectid import ObjectId
-from db_connection import get_db
+from dotenv import load_dotenv
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
+import certifi
 
-# Configuration
-ZMQ_HOST = '0.0.0.0'
-ZMQ_PORT = 5555
+# Load .env
+load_dotenv()
+MONGO_URI = os.getenv("MONGODB_URI")
+if not MONGO_URI:
+    raise ValueError("MONGODB_URI not set in .env")
 
-# Setup MongoDB
-db = get_db()
+# MongoDB client with TLS
+client = MongoClient(
+    MONGO_URI,
+    server_api=ServerApi("1"),
+    tls=True,
+    tlsCAFile=certifi.where(),
+    serverSelectionTimeoutMS=5000,
+)
+try:
+    client.admin.command("ping")
+    print("Connected to MongoDB")
+except Exception as e:
+    print("MongoDB ping failed:", e)
+    exit(1)
+
+db = client["budgetwise_db"]
 transactions = db.transactions
 
-# Setup ZeroMQ REP socket
-context = zmq.Context()
-socket = context.socket(zmq.REP)
-socket.bind(f"tcp://{ZMQ_HOST}:{ZMQ_PORT}")
-print(f"[Microservice] Listening on tcp://{ZMQ_HOST}:{ZMQ_PORT}...")
+# ZeroMQ setup
+ZMQ_ADDR = "tcp://0.0.0.0:5555"
+ctx = zmq.Context()
+socket = ctx.socket(zmq.REP)
+socket.bind(ZMQ_ADDR)
+print(f"[Microservice] Listening on {ZMQ_ADDR}...")
 
 while True:
     try:
-        # Receive request
-        message = socket.recv_json()
-        response = None
+        req = socket.recv_json()
 
-        # If 'id' provided, fetch single transaction
-        txn_id = message.get('id')
-        if txn_id:
+        # ID lookup
+        if "id" in req:
             try:
-                obj_id = ObjectId(txn_id)
-                txn = transactions.find_one({'_id': obj_id}, {'_id': 1, 'date': 1, 'type':1, 'description':1, 'category':1, 'amount':1})
-                if txn:
-                    # Convert ObjectId to string
-                    txn['_id'] = str(txn['_id'])
-                    response = txn
+                oid = ObjectId(req["id"])
+                doc = transactions.find_one(
+                    {"_id": oid},
+                    {"date":1, "type":1, "description":1, "category":1, "amount":1}
+                )
+                if doc:
+                    doc["_id"] = str(doc["_id"])
+                    resp = doc
                 else:
-                    response = {'error': 'Transaction not found'}
-            except Exception as e:
-                response = {'error': f'Invalid id: {e}'}
-        else:
-            # Month+type filter
-            month = message.get('month')
-            tx_type = message.get('type')
-            if not month or not tx_type:
-                response = {'error': 'Must provide either "id" or both "month" and "type"'}
-            else:
-                # Build query: date starts with month, type matches
-                regex = f"^{month}"
-                query = {'date': {'$regex': regex}, 'type': tx_type}
-                cursor = transactions.find(query, {'_id':1, 'date':1, 'type':1, 'description':1, 'category':1, 'amount':1})
-                result_list = []
-                for txn in cursor:
-                    txn['_id'] = str(txn['_id'])
-                    result_list.append(txn)
-                response = result_list
+                    resp = {"error": "Transaction not found"}
+            except Exception as exc:
+                resp = {"error": f"Invalid id: {exc}"}
 
-        # Send JSON response
-        socket.send_json(response)
-    except Exception as exc:
-        # On unexpected errors, reply with error details
-        error_msg = {'error': f'{exc}'}
-        socket.send_json(error_msg)
+        else:
+            # Month/type filter (either or both)
+            query = {}
+            if "month" in req:
+                query["date"] = {"$regex": f"^{req['month']}"}
+            if "type" in req:
+                query["type"] = req["type"]
+            if not query:
+                resp = {"error": "Provide 'id', 'month', or 'type'"}
+            else:
+                docs = []
+                for d in transactions.find(
+                        query,
+                        {"date":1, "type":1, "description":1, "category":1, "amount":1}
+                    ):
+                    d["_id"] = str(d["_id"])
+                    docs.append(d)
+                resp = docs
+
+        socket.send_json(resp)
+
+    except Exception as e:
+        socket.send_json({"error": f"Unexpected error: {e}"})
+        continue
