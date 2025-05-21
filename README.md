@@ -28,4 +28,4 @@ After sending the JSON request, the ZeroMQ recieve method is called to get the J
     * An error if the criteria listed was invalid
 ![alt text](image-1.png)
 
-UML: ![alt text](<Sequence diagram-1.png>)
+UML: ![alt text](image-3-1.png)
